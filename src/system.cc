@@ -206,10 +206,10 @@ void System::formA() {
   sparse_index_base_t indexing;
   mkl_sparse_d_export_csr(matL, &indexing, &rows, &cols, &rows_start, &rows_end,
                           &col_index, &val);
-  for (int i = 0; i < 484; ++i) {
-    std::cout << rows_start[i] << " ";
-  }
-  std::cout << std::endl;
+  // for (int i = 0; i < 484; ++i) {
+  //   std::cout << rows_start[i] << " ";
+  // }
+  // std::cout << std::endl;
 
   std::vector<MKL_INT> A_row_index;
   std::vector<MKL_INT> A_col_index;
@@ -571,8 +571,8 @@ void System::formCEM() {
   std::cout
       << "======Start calculating CEM Basis in each overlapping area======"
       << std::endl;
-  // #pragma omp parallel for
-  for (int i : tq::trange(nparts)) {
+  #pragma omp parallel for
+  for (i = 0; i < nparts; ++i) {
     std::vector<MKL_INT> Ai_col_index(2 * verticesCEM[i].size() *
                                           verticesCEM[i].size() /
                                           overlapping[i].size(),
