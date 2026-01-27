@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
-
 #include <math.h>
 #include <ostream>
 #include <vector>
@@ -565,7 +564,7 @@ void System::formCEM() {
       << "======Start calculating CEM Basis in each overlapping area======"
       << std::endl;
   // #pragma omp parallel for
-  for (int i : tq::trange(nparts)) {
+  for (int i = 0; i < nparts; ++i) {
     std::vector<MKL_INT> Ai_col_index(2 * verticesCEM[i].size() *
                                           verticesCEM[i].size() /
                                           overlapping[i].size(),

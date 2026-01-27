@@ -10,7 +10,7 @@
 int main() {
   auto start = std::chrono::high_resolution_clock::now();
 
-  System sys(400, 100, 1, 4);
+  System sys(100, 100, 4, 4);
   sys.getDataPoisson2d();
   sys.formRHSPoisson2d();
   sys.formA();

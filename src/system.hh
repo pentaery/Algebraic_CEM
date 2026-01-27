@@ -1,7 +1,6 @@
 #include "mkl.h"
 #include "mkl_spblas.h"
 #include "mkl_types.h"
-#include "tqdm.hh"
 #include <algorithm>
 #include <bits/types/clock_t.h>
 #include <chrono>
