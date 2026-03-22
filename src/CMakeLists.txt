@@ -7,7 +7,7 @@ pkg_check_modules(MKL REQUIRED IMPORTED_TARGET mkl-dynamic-lp64-iomp)
 
 # add_executable(test poisson2d.cc system.cc)
 
-add_executable(test test.cc)
+add_executable(test partition.cc)
 target_link_libraries(test /home/ET/yjzhou/HPCSoft/METIS/lib/libmetis.so)
 target_link_libraries(test /home/ET/yjzhou/HPCSoft/GKlib/lib/libGKlib.a)
 

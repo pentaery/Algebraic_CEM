@@ -60,6 +60,7 @@ public:
 public:
   void getDataPoisson2d();
   void getData();
+  void getDatafromMFEM(const char *mesh_file);
   void formRHSPoisson2d();
   void formRHS();
   void testPoisson();

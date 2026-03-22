@@ -1,4 +1,5 @@
 #include "system.hh"
+#include "mfem.hpp"
 #include "mkl_cblas.h"
 #include "mkl_spblas.h"
 #include <cmath>
@@ -7,6 +8,12 @@
 #include <math.h>
 #include <ostream>
 #include <vector>
+
+// Right-hand side function f for MFEM
+static double f_rhs(const mfem::Vector &x) {
+  double pi = M_PI;
+  return 2.0 * pi * pi * std::sin(pi * x(0)) * std::sin(pi * x(1));
+}
 
 void System::formRHSPoisson2d() {
   vecRHS.resize(nvtxs);
@@ -148,6 +155,93 @@ void System::getData() {
   mkl_sparse_destroy(matB);
 }
 
+void System::getDatafromMFEM(const char *mesh_file) {
+  // 1. Open the mesh file.
+  std::ifstream imesh(mesh_file);
+  if (!imesh) {
+    std::cerr << "\nCan not open mesh file: " << mesh_file << '\n' << std::endl;
+    return;
+  }
+
+  // 2. Read the mesh.
+  mfem::Mesh mesh(imesh, 1, 1);
+  imesh.close();
+
+  int dim = mesh.Dimension();
+  int order = 1; // Polynomial order of finite element space
+
+  // 3. Define a finite element space on the mesh.
+  mfem::H1_FECollection fec(order, dim);
+  mfem::FiniteElementSpace fespace(&mesh, &fec);
+
+  // 4. Determine essential boundary dofs (Dirichlet on all boundaries).
+  mfem::Array<int> ess_tdof_list;
+  if (mesh.bdr_attributes.Size()) {
+    mfem::Array<int> ess_bdr(mesh.bdr_attributes.Max());
+    ess_bdr = 1;
+    fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+  }
+
+  // 5. Assemble RHS.
+  mfem::LinearForm b(&fespace);
+  mfem::FunctionCoefficient f_coef(f_rhs);
+  b.AddDomainIntegrator(new mfem::DomainLFIntegrator(f_coef));
+  b.Assemble();
+
+  // 6. Assemble bilinear form and form linear system.
+  mfem::GridFunction x(&fespace);
+  x = 0.0;
+
+  mfem::BilinearForm a(&fespace);
+  mfem::ConstantCoefficient one(1.0);
+  a.AddDomainIntegrator(new mfem::DiffusionIntegrator(one));
+  a.Assemble();
+
+  mfem::SparseMatrix A;
+  mfem::Vector B, X;
+  a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+
+  nvtxs = A.Height();
+  rows = nvtxs;
+  cols = nvtxs;
+
+  vecRHS.resize(B.Size());
+  for (int i = 0; i < B.Size(); ++i) {
+    vecRHS[i] = B(i);
+  }
+
+  // 7. Convert A (CSR) to MKL sparse matrix (matL).
+  int *I = A.GetI();
+  int *J = A.GetJ();
+  double *Data = A.GetData();
+  const int nnz = A.NumNonZeroElems();
+
+  std::vector<MKL_INT> row_indx;
+  std::vector<MKL_INT> col_indx;
+  std::vector<double> values;
+  row_indx.reserve(nnz);
+  col_indx.reserve(nnz);
+  values.reserve(nnz);
+
+  for (int row = 0; row < A.Height(); ++row) {
+    for (int idx = I[row]; idx < I[row + 1]; ++idx) {
+      row_indx.push_back(static_cast<MKL_INT>(row));
+      col_indx.push_back(static_cast<MKL_INT>(J[idx]));
+      if (J[idx] == row) {
+        values.push_back(0.0);
+      } else {
+        values.push_back(Data[idx]);
+      }
+    }
+  }
+
+  sparse_matrix_t matB;
+  mkl_sparse_d_create_coo(&matB, indexing, nvtxs, nvtxs, values.size(),
+                          row_indx.data(), col_indx.data(), values.data());
+  mkl_sparse_convert_csr(matB, SPARSE_OPERATION_NON_TRANSPOSE, &matL);
+  mkl_sparse_destroy(matB);
+}
+
 void System::graphPartition() {
   auto start = std::chrono::high_resolution_clock::now();
   std::cout << "======Phase I: Graph Partitioning======" << std::endl;
@@ -276,6 +370,8 @@ void System::solve() {
 }
 
 void System::findNeighbours() {
+  // vertices存放每个子域的点集，neighbours存放每个子域的邻居子域，overlapping存放每个子域的重叠区域（包括自己和邻居）
+  // globalTolocal存放每个子域内点的全局编号到局部编号的映射，globalTolocalCEM存放每个子域内重叠区域点的全局编号到局部编号的映射，localtoGlobalCEM存放每个子域内重叠区域点的局部编号到全局编号的映射
   auto start = std::chrono::high_resolution_clock::now();
   std::cout
       << "======Phase II: Construct the neighours for the CEM method======"

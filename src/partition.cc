@@ -26,7 +26,7 @@ int main(int argc, char *argv[]) {
     order = std::atoi(argv[2]);
   }
 
-  // 2. Open the mesh file.
+    // 2. Open the mesh file.
   std::ifstream imesh(mesh_file);
   if (!imesh) {
     std::cerr << "\nCan not open mesh file: " << mesh_file << '\n' << std::endl;
@@ -102,6 +102,11 @@ int main(int argc, char *argv[]) {
   std::cout << "CSR nnz: " << A.NumNonZeroElems() << std::endl;
   std::cout << "CSR arrays ready: I (size " << (A.Height() + 1)
             << "), J/Data (size " << A.NumNonZeroElems() << ")" << std::endl;
+  // Check that I[0] == 0
+  if (I[0] != 0) {
+    std::cerr << "Error: CSR row offsets I do not start at 0." << std::endl;
+    return 1;
+  }
 
   // 11.5. Remove diagonal entries from A (set to zero) before partitioning.
   for (int row = 0; row < A.Height(); ++row) {
@@ -117,24 +122,16 @@ int main(int argc, char *argv[]) {
   const int n = A.Height();
   int num_parts = 100;
 
-  // Use CSR I/J directly for METIS (convert to idx_t).
-  const int nnz = A.NumNonZeroElems();
-  std::vector<idx_t> xadj(n + 1);
-  std::vector<idx_t> adjncy(nnz);
-  for (int i = 0; i <= n; ++i) {
-    xadj[i] = static_cast<idx_t>(I[i]);
-  }
-  for (int k = 0; k < nnz; ++k) {
-    adjncy[k] = static_cast<idx_t>(J[k]);
-  }
+  // Use CSR I/J directly for METIS (idx_t is compatible with int in METIS).
 
   idx_t nvtxs = static_cast<idx_t>(n);
   idx_t ncon = 1;
   idx_t objval = 0;
   std::vector<idx_t> part(nvtxs, 0);
 
-  METIS_PartGraphKway(&nvtxs, &ncon, xadj.data(), adjncy.data(), NULL, NULL,
-                      NULL, &num_parts, NULL, NULL, NULL, &objval, part.data());
+  METIS_PartGraphKway(&nvtxs, &ncon, reinterpret_cast<idx_t *>(I),
+                      reinterpret_cast<idx_t *>(J), NULL, NULL, NULL,
+                      &num_parts, NULL, NULL, NULL, &objval, part.data());
 
   std::ofstream part_ofs("../../script/partition.txt");
   for (int i = 0; i < n; ++i) {

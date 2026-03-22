@@ -12,11 +12,17 @@ int main() {
 
   System sys(100, 100, 4, 4);
   sys.getDataPoisson2d();
+  // get csr matrix matL(全矩阵)
   sys.formRHSPoisson2d();
+  // get rhs vector vecRHS
   sys.formA();
+  // form matrix matA from matL, and convert it to CSR format for
+  // pardiso(上三角矩阵)
   sys.solve();
+  // solve the system using pardiso and get the solution in vecSOL
   sys.graphPartition();
-  // sys.testPoisson();
+  // partition the graph to nparts parts using metis and get the partition
+  // result in part sys.testPoisson();
   sys.findNeighbours();
   sys.formAUX();
   sys.formCEM();
