@@ -9,7 +9,22 @@ double f_rhs(const mfem::Vector &x) {
 
 CEM::CEM()
     : matA(nullptr), matL(nullptr), indexing(SPARSE_INDEX_BASE_ZERO), rows(0),
-      cols(0), nvtxs(0) {}
+      cols(0), nvtxs(0), nparts(10), overlap(2), k0(3), cStar(1.0) {}
+
+CEM::CEM(int nparts_, int overlap_, int k0_)
+    : matA(nullptr), matL(nullptr), indexing(SPARSE_INDEX_BASE_ZERO), rows(0),
+      cols(0), nvtxs(0), nparts(nparts_), overlap(overlap_), k0(k0_),
+      cStar(1.0) {
+  if (nparts <= 0) {
+    throw std::runtime_error("nparts must be positive.");
+  }
+  if (overlap < 0) {
+    throw std::runtime_error("overlap must be non-negative.");
+  }
+  if (k0 <= 0) {
+    throw std::runtime_error("k0 must be positive.");
+  }
+}
 
 CEM::~CEM() {
   destroyIfAllocated(matA);
@@ -63,6 +78,8 @@ void CEM::getDatafromMFEM(const char *mesh_file, int order) {
   nvtxs = static_cast<MKL_INT>(A.Height());
   rows = nvtxs;
   cols = nvtxs;
+  cStar = static_cast<double>(nvtxs);
+  part.assign(static_cast<size_t>(nvtxs), 0);
 
   vecRHS.assign(B.Size(), 0.0);
   for (int i = 0; i < B.Size(); ++i) {
@@ -75,18 +92,6 @@ void CEM::getDatafromMFEM(const char *mesh_file, int order) {
   const double *Data = A.GetData();
 
   const int nnz = A.NumNonZeroElems();
-  for (int i = 0; i < std::min(100, nvtxs + 1); ++i) {
-    std::cout << I[i] << " ";
-  }
-  std::cout << std::endl;
-  for (int i = 0; i < std::min(100, nnz); ++i) {
-    std::cout << J[i] << " ";
-  }
-  std::cout << std::endl;
-  for (int i = 0; i < std::min(100, nnz); ++i) {
-    std::cout << Data[i] << " ";
-  }
-  std::cout << std::endl;
 
   // Build and store L in CSR directly from MFEM's A-CSR.
   const auto max_mkl_int = std::numeric_limits<MKL_INT>::max();
@@ -180,18 +185,6 @@ void CEM::getDatafromMFEM(const char *mesh_file, int order) {
       &matL, indexing, nvtxs, nvtxs, matL_rows_start.data(),
       matL_rows_end.data(), matL_col_index.data(), matL_values.data());
 
-  for (int i = 0; i < 100; ++i) {
-    std::cout << matL_rows_start[i] << " ";
-  }
-  std::cout << std::endl;
-  for (int i = 0; i < 100; ++i) {
-    std::cout << matL_col_index[i] << " ";
-  }
-  std::cout << std::endl;
-  for (int i = 0; i < 100; ++i) {
-    std::cout << matL_values[i] << " ";
-  }
-  std::cout << std::endl;
   if (create_status != SPARSE_STATUS_SUCCESS) {
     throw std::runtime_error("mkl_sparse_d_create_csr failed with status " +
                              std::to_string(static_cast<int>(create_status)));
@@ -199,6 +192,512 @@ void CEM::getDatafromMFEM(const char *mesh_file, int order) {
 
   std::cout << "MFEM assembled reduced system with nvtxs=" << nvtxs
             << " and nnz=" << nnz << std::endl;
+}
+
+void CEM::graphPartition() {
+  if (matL == nullptr) {
+    throw std::runtime_error(
+        "matL is not initialized. Call getDatafromMFEM() first.");
+  }
+  if (nvtxs <= 0) {
+    throw std::runtime_error("Invalid nvtxs for graph partitioning.");
+  }
+  if (nparts <= 0) {
+    throw std::runtime_error("nparts must be positive for graph partitioning.");
+  }
+
+  auto start = std::chrono::high_resolution_clock::now();
+  std::cout << "======Phase I: Graph Partitioning======" << std::endl;
+
+  MKL_INT *rows_start = nullptr;
+  MKL_INT *rows_end = nullptr;
+  MKL_INT *col_index = nullptr;
+  double *val = nullptr;
+
+  const sparse_status_t export_status = mkl_sparse_d_export_csr(
+      matL, &indexing, &rows, &cols, &rows_start, &rows_end, &col_index, &val);
+  if (export_status != SPARSE_STATUS_SUCCESS) {
+    throw std::runtime_error(
+        "mkl_sparse_d_export_csr(matL) failed with status " +
+        std::to_string(static_cast<int>(export_status)));
+  }
+
+  std::vector<idx_t> xadj(static_cast<size_t>(nvtxs) + 1, 0);
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    if (rows_start[i] < 0) {
+      throw std::runtime_error(
+          "Invalid CSR row pointer (negative rows_start).");
+    }
+    xadj[static_cast<size_t>(i)] = static_cast<idx_t>(rows_start[i]);
+  }
+  xadj[static_cast<size_t>(nvtxs)] = static_cast<idx_t>(rows_end[nvtxs - 1]);
+
+  const MKL_INT nnz = rows_end[nvtxs - 1];
+  std::vector<idx_t> adjncy(static_cast<size_t>(nnz), 0);
+  for (MKL_INT i = 0; i < nnz; ++i) {
+    if (col_index[i] < 0) {
+      throw std::runtime_error(
+          "Invalid CSR column index (negative col_index).");
+    }
+    adjncy[static_cast<size_t>(i)] = static_cast<idx_t>(col_index[i]);
+  }
+
+  idx_t nVertices = static_cast<idx_t>(nvtxs);
+  idx_t ncon = 1;
+  idx_t objval = 0;
+  std::vector<idx_t> part_local(static_cast<size_t>(nvtxs), 0);
+
+  idx_t options[METIS_NOPTIONS];
+  METIS_SetDefaultOptions(options);
+  options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_VOL;
+  options[METIS_OPTION_NCUTS] = 1;
+
+  const int metis_status = METIS_PartGraphKway(
+      &nVertices, &ncon, xadj.data(), adjncy.data(), nullptr, nullptr, nullptr,
+      &nparts, nullptr, nullptr, options, &objval, part_local.data());
+
+  if (metis_status != METIS_OK) {
+    throw std::runtime_error("METIS_PartGraphKway failed with code " +
+                             std::to_string(metis_status));
+  }
+
+  part = std::move(part_local);
+
+  std::ofstream outfile("../../partition.txt");
+  if (!outfile.is_open()) {
+    throw std::runtime_error("Cannot open ../../partition.txt for writing.");
+  }
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    outfile << part[static_cast<size_t>(i)] << ' ';
+  }
+  outfile << '\n';
+  outfile.close();
+
+  std::cout << "Objective for the partition is " << objval << std::endl;
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration = end - start;
+  std::cout << "======Finished with " << duration.count()
+            << " ms======" << std::endl;
+}
+
+void CEM::findNeighbours() {
+  if (matL == nullptr) {
+    throw std::runtime_error(
+        "matL is not initialized. Call getDatafromMFEM() first.");
+  }
+  if (nvtxs <= 0) {
+    throw std::runtime_error("Invalid nvtxs for neighbour construction.");
+  }
+  if (nparts <= 0) {
+    throw std::runtime_error("nparts must be positive.");
+  }
+  if (part.size() != static_cast<size_t>(nvtxs)) {
+    throw std::runtime_error(
+        "Partition vector size mismatch. Call graphPartition() first.");
+  }
+
+  auto start = std::chrono::high_resolution_clock::now();
+  std::cout
+      << "======Phase II: Construct the neighours for the CEM method======"
+      << std::endl;
+
+  vertices.assign(static_cast<size_t>(nparts), std::set<idx_t>{});
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    const idx_t p = part[static_cast<size_t>(i)];
+    if (p < 0 || p >= nparts) {
+      throw std::runtime_error("Invalid partition id in part[].");
+    }
+    vertices[static_cast<size_t>(p)].insert(static_cast<idx_t>(i));
+  }
+
+  neighbours.assign(static_cast<size_t>(nparts), std::set<idx_t>{});
+
+  MKL_INT *rows_start = nullptr;
+  MKL_INT *rows_end = nullptr;
+  MKL_INT *col_index = nullptr;
+  double *val = nullptr;
+  const sparse_status_t export_status = mkl_sparse_d_export_csr(
+      matL, &indexing, &rows, &cols, &rows_start, &rows_end, &col_index, &val);
+  if (export_status != SPARSE_STATUS_SUCCESS) {
+    throw std::runtime_error(
+        "mkl_sparse_d_export_csr(matL) failed with status " +
+        std::to_string(static_cast<int>(export_status)));
+  }
+
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    for (MKL_INT j = rows_start[i]; j < rows_end[i]; ++j) {
+      const MKL_INT col = col_index[j];
+      if (col < 0 || col >= nvtxs) {
+        throw std::runtime_error("Invalid column index in matL CSR.");
+      }
+      const idx_t pi = part[static_cast<size_t>(i)];
+      const idx_t pj = part[static_cast<size_t>(col)];
+      if (pi != pj) {
+        neighbours[static_cast<size_t>(pi)].insert(pj);
+      }
+    }
+  }
+
+  overlapping.assign(static_cast<size_t>(nparts), std::set<idx_t>{});
+  if (overlap > 0) {
+    for (idx_t j = 0; j < nparts; ++j) {
+      auto &overlap_j = overlapping[static_cast<size_t>(j)];
+      const auto &nbr_j = neighbours[static_cast<size_t>(j)];
+      overlap_j.insert(nbr_j.begin(), nbr_j.end());
+      overlap_j.insert(j);
+    }
+  }
+
+  for (int i = 1; i < overlap; ++i) {
+    for (idx_t j = 0; j < nparts; ++j) {
+      std::set<idx_t> temp;
+      for (const auto &element : overlapping[static_cast<size_t>(j)]) {
+        const auto &nbr_e = neighbours[static_cast<size_t>(element)];
+        temp.insert(nbr_e.begin(), nbr_e.end());
+      }
+      auto &overlap_j = overlapping[static_cast<size_t>(j)];
+      overlap_j.insert(temp.begin(), temp.end());
+    }
+  }
+
+  globalTolocal.assign(static_cast<size_t>(nvtxs), 0);
+  count.assign(static_cast<size_t>(nparts), 0);
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    const idx_t p = part[static_cast<size_t>(i)];
+    globalTolocal[static_cast<size_t>(i)] = count[static_cast<size_t>(p)];
+    ++count[static_cast<size_t>(p)];
+  }
+
+  verticesCEM.assign(static_cast<size_t>(nparts), std::unordered_set<idx_t>{});
+  globalTolocalCEM.assign(static_cast<size_t>(nparts),
+                          std::unordered_map<idx_t, idx_t>{});
+  for (idx_t i = 0; i < nparts; ++i) {
+    idx_t local_idx = 0;
+    for (const auto &element : overlapping[static_cast<size_t>(i)]) {
+      const auto &vset = vertices[static_cast<size_t>(element)];
+      verticesCEM[static_cast<size_t>(i)].insert(vset.begin(), vset.end());
+      for (const auto &element2 : vset) {
+        globalTolocalCEM[static_cast<size_t>(i)].insert(
+            {element2, local_idx++});
+      }
+    }
+  }
+
+  localtoGlobalCEM.assign(static_cast<size_t>(nparts), std::vector<idx_t>{});
+  for (idx_t i = 0; i < nparts; ++i) {
+    idx_t index = 0;
+    auto &local_to_global = localtoGlobalCEM[static_cast<size_t>(i)];
+    local_to_global.resize(verticesCEM[static_cast<size_t>(i)].size());
+    for (const auto &element : overlapping[static_cast<size_t>(i)]) {
+      for (const auto &element2 : vertices[static_cast<size_t>(element)]) {
+        if (index >= static_cast<idx_t>(local_to_global.size())) {
+          throw std::runtime_error(
+              "Inconsistent local-to-global size while forming overlap map.");
+        }
+        local_to_global[static_cast<size_t>(index++)] = element2;
+      }
+    }
+    if (index != static_cast<idx_t>(local_to_global.size())) {
+      throw std::runtime_error(
+          "Incomplete local-to-global mapping while forming overlap map.");
+    }
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration = end - start;
+  std::cout << "======Finished with " << duration.count()
+            << " ms======" << std::endl;
+}
+
+void CEM::formAUX() {
+  auto start = std::chrono::high_resolution_clock::now();
+  std::cout << "======Phase III: Construct the Auxiliary space======"
+            << std::endl;
+
+  if (matL == nullptr) {
+    throw std::runtime_error(
+        "matL is not initialized. Call getDatafromMFEM() first.");
+  }
+  if (k0 <= 0) {
+    throw std::runtime_error("k0 must be positive before formAUX().");
+  }
+  if (cStar <= 0.0) {
+    throw std::runtime_error("cStar must be positive before formAUX().");
+  }
+  if (part.size() != static_cast<size_t>(nvtxs)) {
+    throw std::runtime_error(
+        "Partition vector size mismatch. Call graphPartition() first.");
+  }
+  if (count.size() != static_cast<size_t>(nparts)) {
+    throw std::runtime_error(
+        "Partition local counts are missing. Call findNeighbours() first.");
+  }
+
+  MKL_INT *rows_start = nullptr;
+  MKL_INT *rows_end = nullptr;
+  MKL_INT *col_index = nullptr;
+  double *val = nullptr;
+  const sparse_status_t export_status = mkl_sparse_d_export_csr(
+      matL, &indexing, &rows, &cols, &rows_start, &rows_end, &col_index, &val);
+  if (export_status != SPARSE_STATUS_SUCCESS) {
+    throw std::runtime_error(
+        "mkl_sparse_d_export_csr(matL) failed with status " +
+        std::to_string(static_cast<int>(export_status)));
+  }
+
+  char which = 'S';
+  MKL_INT pm[128];
+  mkl_sparse_ee_init(pm);
+  pm[7] = 1;
+  pm[8] = 1;
+
+  std::vector<std::vector<MKL_INT>> Ai_col_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Ai_row_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<double>> Ai_values(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Si_col_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Si_row_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<double>> Si_values(static_cast<size_t>(nparts));
+
+  for (MKL_INT i = 0; i < nvtxs; ++i) {
+    for (MKL_INT j = rows_start[i]; j < rows_end[i]; ++j) {
+      const MKL_INT col = col_index[j];
+      if (col < 0 || col >= nvtxs) {
+        throw std::runtime_error("Invalid column index in matL CSR.");
+      }
+
+      const idx_t pi = part[static_cast<size_t>(i)];
+      const idx_t pj = part[static_cast<size_t>(col)];
+      if (pi < 0 || pi >= nparts || pj < 0 || pj >= nparts) {
+        throw std::runtime_error("Invalid partition id while building AUX.");
+      }
+
+      if (pi == pj) {
+        const size_t part_id = static_cast<size_t>(pi);
+        const MKL_INT local_i = globalTolocal[static_cast<size_t>(i)];
+        if (col != i) {
+          const MKL_INT local_col = globalTolocal[static_cast<size_t>(col)];
+
+          Ai_row_index[part_id].push_back(local_i);
+          Ai_col_index[part_id].push_back(local_i);
+          Ai_values[part_id].push_back(val[j]);
+
+          Ai_row_index[part_id].push_back(local_i);
+          Ai_col_index[part_id].push_back(local_col);
+          Ai_values[part_id].push_back(-val[j]);
+
+          Si_col_index[part_id].push_back(local_i);
+          Si_row_index[part_id].push_back(local_i);
+          Si_values[part_id].push_back(val[j] / (cStar * cStar * 2.0));
+        } else {
+          Ai_row_index[part_id].push_back(local_i);
+          Ai_col_index[part_id].push_back(local_i);
+          Ai_values[part_id].push_back(val[j]);
+
+          Si_col_index[part_id].push_back(local_i);
+          Si_row_index[part_id].push_back(local_i);
+          Si_values[part_id].push_back(val[j] / (cStar * cStar));
+        }
+      }
+    }
+  }
+
+  eigenvalue.resize(static_cast<size_t>(nparts));
+  eigenvector.resize(static_cast<size_t>(nparts));
+  for (idx_t i = 0; i < nparts; ++i) {
+    const size_t part_id = static_cast<size_t>(i);
+    const MKL_INT count_i = count[part_id];
+    if (count_i < 0) {
+      throw std::runtime_error("Negative local vertex count in formAUX().");
+    }
+    eigenvalue[part_id].assign(static_cast<size_t>(k0), 0.0);
+    eigenvector[part_id].assign(static_cast<size_t>(k0 * count_i), 0.0);
+  }
+
+  std::vector<double> res(static_cast<size_t>(nparts), 0.0);
+
+  matrix_descr descr;
+  descr.type = SPARSE_MATRIX_TYPE_SYMMETRIC;
+  descr.diag = SPARSE_DIAG_NON_UNIT;
+  descr.mode = SPARSE_FILL_MODE_UPPER;
+
+  for (idx_t i = 0; i < nparts; ++i) {
+    const size_t part_id = static_cast<size_t>(i);
+    const MKL_INT count_i = count[part_id];
+    if (count_i <= 0) {
+      std::cout << "part: " << i << " skipped in formAUX because count is zero."
+                << std::endl;
+      continue;
+    }
+
+    sparse_matrix_t AiCOO = nullptr;
+    sparse_matrix_t SiCOO = nullptr;
+    sparse_matrix_t Ai = nullptr;
+    sparse_matrix_t Si = nullptr;
+
+    const sparse_status_t ai_coo_status = mkl_sparse_d_create_coo(
+        &AiCOO, indexing, count_i, count_i,
+        static_cast<MKL_INT>(Ai_values[part_id].size()),
+        Ai_row_index[part_id].data(), Ai_col_index[part_id].data(),
+        Ai_values[part_id].data());
+    if (ai_coo_status != SPARSE_STATUS_SUCCESS) {
+      throw std::runtime_error("mkl_sparse_d_create_coo(Ai) failed.");
+    }
+
+    const sparse_status_t si_coo_status = mkl_sparse_d_create_coo(
+        &SiCOO, indexing, count_i, count_i,
+        static_cast<MKL_INT>(Si_values[part_id].size()),
+        Si_row_index[part_id].data(), Si_col_index[part_id].data(),
+        Si_values[part_id].data());
+    if (si_coo_status != SPARSE_STATUS_SUCCESS) {
+      mkl_sparse_destroy(AiCOO);
+      throw std::runtime_error("mkl_sparse_d_create_coo(Si) failed.");
+    }
+
+    const sparse_status_t ai_csr_status =
+        mkl_sparse_convert_csr(AiCOO, SPARSE_OPERATION_NON_TRANSPOSE, &Ai);
+    const sparse_status_t si_csr_status =
+        mkl_sparse_convert_csr(SiCOO, SPARSE_OPERATION_NON_TRANSPOSE, &Si);
+    mkl_sparse_destroy(AiCOO);
+    mkl_sparse_destroy(SiCOO);
+    if (ai_csr_status != SPARSE_STATUS_SUCCESS ||
+        si_csr_status != SPARSE_STATUS_SUCCESS) {
+      if (Ai != nullptr) {
+        mkl_sparse_destroy(Ai);
+      }
+      if (Si != nullptr) {
+        mkl_sparse_destroy(Si);
+      }
+      throw std::runtime_error(
+          "mkl_sparse_convert_csr failed for AUX local matrices.");
+    }
+
+    int k = 0;
+    const sparse_status_t gv_status = mkl_sparse_d_gv(
+        &which, pm, Ai, descr, Si, descr, k0, &k, eigenvalue[part_id].data(),
+        eigenvector[part_id].data(), &res[part_id]);
+
+    mkl_sparse_destroy(Ai);
+    mkl_sparse_destroy(Si);
+
+    if (gv_status != SPARSE_STATUS_SUCCESS) {
+      std::cout << "======error in mkl_sparse_d_gv: "
+                << static_cast<int>(gv_status) << "======" << std::endl;
+    }
+    if (k < k0) {
+      std::cout << "===========Not enough eigenvalues in part " << i
+                << "===========" << std::endl;
+    }
+    std::cout << "part: " << i << " residual: " << res[part_id]
+              << " Smallest eigenvalue: " << eigenvalue[part_id][0]
+              << std::endl;
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration = end - start;
+  std::cout << "======Finish solving eigen problem in each coarse element with "
+            << duration.count() << " ms======" << std::endl;
+}
+
+void CEM::exportNeighboursData() const {
+  if (nvtxs <= 0 || nparts <= 0) {
+    throw std::runtime_error(
+        "Invalid nvtxs/nparts for neighbours data export.");
+  }
+  if (part.size() != static_cast<size_t>(nvtxs)) {
+    throw std::runtime_error(
+        "Partition vector size mismatch in neighbours data export.");
+  }
+  if (vertices.size() != static_cast<size_t>(nparts) ||
+      overlapping.size() != static_cast<size_t>(nparts) ||
+      verticesCEM.size() != static_cast<size_t>(nparts)) {
+    throw std::runtime_error(
+        "findNeighbours data is incomplete. Call findNeighbours() first.");
+  }
+
+  const std::string base_dir = "../../data";
+
+  {
+    std::ofstream meta(base_dir + "/neighbours_meta.txt");
+    if (!meta.is_open()) {
+      throw std::runtime_error("Cannot open neighbours_meta.txt for writing.");
+    }
+    meta << "nvtxs " << nvtxs << '\n';
+    meta << "nparts " << nparts << '\n';
+    meta << "overlap " << overlap << '\n';
+  }
+
+  {
+    std::ofstream part_file(base_dir + "/neighbours_part.txt");
+    if (!part_file.is_open()) {
+      throw std::runtime_error("Cannot open neighbours_part.txt for writing.");
+    }
+    for (MKL_INT i = 0; i < nvtxs; ++i) {
+      part_file << part[static_cast<size_t>(i)] << ' ';
+    }
+    part_file << '\n';
+  }
+
+  for (idx_t i = 0; i < nparts; ++i) {
+    const size_t part_idx = static_cast<size_t>(i);
+
+    {
+      std::ofstream core_file(base_dir + "/neighbours_vertices_" +
+                              std::to_string(i) + ".txt");
+      if (!core_file.is_open()) {
+        throw std::runtime_error("Cannot open neighbours_vertices file.");
+      }
+      for (const auto &v : vertices[part_idx]) {
+        core_file << v << ' ';
+      }
+      core_file << '\n';
+    }
+
+    {
+      std::ofstream overlap_parts_file(base_dir +
+                                       "/neighbours_overlapping_parts_" +
+                                       std::to_string(i) + ".txt");
+      if (!overlap_parts_file.is_open()) {
+        throw std::runtime_error(
+            "Cannot open neighbours_overlapping_parts file.");
+      }
+      for (const auto &p : overlapping[part_idx]) {
+        overlap_parts_file << p << ' ';
+      }
+      overlap_parts_file << '\n';
+    }
+
+    {
+      std::vector<idx_t> overlap_vertices(verticesCEM[part_idx].begin(),
+                                          verticesCEM[part_idx].end());
+      std::sort(overlap_vertices.begin(), overlap_vertices.end());
+
+      std::ofstream overlap_vertices_file(
+          base_dir + "/neighbours_verticesCEM_" + std::to_string(i) + ".txt");
+      if (!overlap_vertices_file.is_open()) {
+        throw std::runtime_error("Cannot open neighbours_verticesCEM file.");
+      }
+      for (const auto &v : overlap_vertices) {
+        overlap_vertices_file << v << ' ';
+      }
+      overlap_vertices_file << '\n';
+    }
+
+    {
+      std::ofstream local_to_global_file(base_dir +
+                                         "/neighbours_localtoGlobalCEM_" +
+                                         std::to_string(i) + ".txt");
+      if (!local_to_global_file.is_open()) {
+        throw std::runtime_error(
+            "Cannot open neighbours_localtoGlobalCEM file.");
+      }
+      for (const auto &v : localtoGlobalCEM[part_idx]) {
+        local_to_global_file << v << ' ';
+      }
+      local_to_global_file << '\n';
+    }
+  }
+
+  std::cout << "Exported neighbours data to ../../data/" << std::endl;
 }
 
 double CEM::solveFromLAndReleaseA() {
@@ -228,63 +727,50 @@ double CEM::solveFromLAndReleaseA() {
           std::to_string(static_cast<int>(export_l_status)));
     }
 
-    // Calculate NNZ for matA and fill row pointers.
-    // Each row of matA will have 1 diagonal element + all upper triangular
-    // elements from L.
-    MKL_INT nnz_A = 0;
+    // Build upper-triangular CSR of A directly from CSR of L for PARDISO.
+    // Mapping: A(i,i)=sum_j L(i,j), A(i,j)=-L(i,j) for j>i.
+    std::vector<MKL_INT> ia_upper(static_cast<size_t>(nvtxs) + 1, 0);
     for (MKL_INT i = 0; i < nvtxs; ++i) {
-      nnz_A++; // The diagonal entry (sum of row L)
+      MKL_INT row_nnz = 1; // diagonal
       for (MKL_INT j = l_rows_start[i]; j < l_rows_end[i]; ++j) {
         if (l_col_index[j] > i) {
-          nnz_A++; // Upper triangular off-diagonal entry
+          ++row_nnz;
         }
       }
+      ia_upper[static_cast<size_t>(i + 1)] =
+          ia_upper[static_cast<size_t>(i)] + row_nnz;
     }
 
-    std::vector<MKL_INT> matA_rows_start(static_cast<size_t>(nvtxs), 0);
-    std::vector<MKL_INT> matA_rows_end(static_cast<size_t>(nvtxs), 0);
-    std::vector<MKL_INT> matA_col_index(static_cast<size_t>(nnz_A), 0);
-    std::vector<double> matA_values(static_cast<size_t>(nnz_A), 0.0);
+    const MKL_INT upper_nnz = ia_upper[static_cast<size_t>(nvtxs)];
+    std::vector<MKL_INT> ja_upper(static_cast<size_t>(upper_nnz), 0);
+    std::vector<double> a_upper(static_cast<size_t>(upper_nnz), 0.0);
 
-    auto releaseMatACSR = [&]() {
-      std::vector<MKL_INT>().swap(matA_rows_start);
-      std::vector<MKL_INT>().swap(matA_rows_end);
-      std::vector<MKL_INT>().swap(matA_col_index);
-      std::vector<double>().swap(matA_values);
-    };
-
-    MKL_INT current_idx = 0;
     for (MKL_INT i = 0; i < nvtxs; ++i) {
-      matA_rows_start[i] = current_idx;
+      MKL_INT write = ia_upper[static_cast<size_t>(i)];
 
-      // Reserve space for diagonal entry at the beginning of the row
-      const MKL_INT diag_loc = current_idx;
-      matA_col_index[current_idx] = i;
-      matA_values[current_idx] = 0.0;
-      current_idx++;
+      // Diagonal entry first.
+      ja_upper[static_cast<size_t>(write)] = i;
+      double diag_value = 0.0;
+      for (MKL_INT j = l_rows_start[i]; j < l_rows_end[i]; ++j) {
+        diag_value += l_val[j];
+      }
+      a_upper[static_cast<size_t>(write)] = diag_value;
+      ++write;
 
       for (MKL_INT j = l_rows_start[i]; j < l_rows_end[i]; ++j) {
-        // Accumulate to diagonal sum: A(i,i) += L(i,j)
-        matA_values[diag_loc] += l_val[j];
-
-        // Add off-diagonal entry: A(i,j) = -L(i,j) for j > i
-        if (l_col_index[j] > i) {
-          matA_col_index[current_idx] = l_col_index[j];
-          matA_values[current_idx] = -l_val[j];
-          current_idx++;
+        const MKL_INT col = l_col_index[j];
+        if (col > i) {
+          ja_upper[static_cast<size_t>(write)] = col;
+          a_upper[static_cast<size_t>(write)] = -l_val[j];
+          ++write;
         }
       }
-      matA_rows_end[i] = current_idx;
-    }
 
-    if (current_idx != nnz_A) {
-      throw std::runtime_error("Internal error constructing matA CSR.");
+      if (write != ia_upper[static_cast<size_t>(i + 1)]) {
+        throw std::runtime_error(
+            "Internal error constructing upper-triangular A CSR.");
+      }
     }
-
-    MKL_INT *rows_start = matA_rows_start.data();
-    MKL_INT *rows_end = matA_rows_end.data();
-    MKL_INT *col_index = matA_col_index.data();
-    double *val = matA_values.data();
 
     MKL_INT perm[64], iparm[64];
     void *pt[64];
@@ -304,43 +790,6 @@ double CEM::solveFromLAndReleaseA() {
       vecSOL.assign(nvtxs, 0.0);
     }
 
-    std::vector<MKL_INT> ia(static_cast<size_t>(nvtxs) + 1, 0);
-    for (MKL_INT i = 0; i < nvtxs; ++i) {
-      ia[static_cast<size_t>(i)] = rows_start[i];
-    }
-    ia[static_cast<size_t>(nvtxs)] = rows_end[nvtxs - 1];
-
-    if (ia.front() != 0) {
-      throw std::runtime_error(
-          "Invalid CSR ia[0]; expected 0 for 0-based indexing.");
-    }
-    for (MKL_INT i = 0; i < nvtxs; ++i) {
-      if (ia[static_cast<size_t>(i)] > ia[static_cast<size_t>(i + 1)]) {
-        throw std::runtime_error(
-            "Invalid CSR row pointer: ia is not monotonic.");
-      }
-    }
-
-    // Build upper-triangular CSR arrays for mtype=2.
-    std::vector<MKL_INT> ia_upper(static_cast<size_t>(nvtxs) + 1, 0);
-    std::vector<MKL_INT> ja_upper;
-    std::vector<double> a_upper;
-
-    ja_upper.reserve(static_cast<size_t>(rows_end[nvtxs - 1]));
-    a_upper.reserve(static_cast<size_t>(rows_end[nvtxs - 1]));
-
-    for (MKL_INT i = 0; i < nvtxs; ++i) {
-      ia_upper[static_cast<size_t>(i)] = static_cast<MKL_INT>(ja_upper.size());
-      for (MKL_INT idx = rows_start[i]; idx < rows_end[i]; ++idx) {
-        if (col_index[idx] >= i) { // keep upper triangle including diagonal
-          ja_upper.push_back(col_index[idx]);
-          a_upper.push_back(val[idx]);
-        }
-      }
-    }
-    ia_upper[static_cast<size_t>(nvtxs)] =
-        static_cast<MKL_INT>(ja_upper.size());
-
     if (ia_upper.front() != 0) {
       throw std::runtime_error(
           "Invalid CSR ia[0]; expected 0 for 0-based indexing.");
@@ -353,25 +802,10 @@ double CEM::solveFromLAndReleaseA() {
       }
     }
 
-    for (int i = 0; i < 100; ++i) {
-      std::cout << ia_upper[i] << " ";
-    }
-    std::cout << std::endl;
-    for (int i = 0; i < 100; ++i) {
-      std::cout << ja_upper[i] << " ";
-    }
-    std::cout << std::endl;
-    for (int i = 0; i < 100; ++i) {
-      std::cout << a_upper[i] << " ";
-    }
-    std::cout << std::endl;
-
     pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_upper.data(),
             ia_upper.data(), ja_upper.data(), perm, &nrhs, iparm, &msglv1,
             vecRHS.data(), vecSOL.data(), &error);
 
-    std::cout << "PARDISO phase " << phase << " completed with error code "
-              << error << std::endl;
     if (error != 0) {
       std::cout << "PARDISO error: " << error << std::endl;
     }
@@ -382,10 +816,18 @@ double CEM::solveFromLAndReleaseA() {
             vecRHS.data(), vecSOL.data(), &error);
 
     std::vector<double> Ax(static_cast<size_t>(nvtxs), 0.0);
+    // a_upper/ia_upper/ja_upper stores only upper triangle for a symmetric A.
+    // Expand symmetric contributions so Ax uses the full matrix action.
     for (MKL_INT i = 0; i < nvtxs; ++i) {
-      for (MKL_INT j = rows_start[i]; j < rows_end[i]; ++j) {
-        Ax[static_cast<size_t>(i)] +=
-            val[j] * vecSOL[static_cast<size_t>(col_index[j])];
+      for (MKL_INT idx = ia_upper[static_cast<size_t>(i)];
+           idx < ia_upper[static_cast<size_t>(i + 1)]; ++idx) {
+        const MKL_INT col = ja_upper[static_cast<size_t>(idx)];
+        const double aij = a_upper[static_cast<size_t>(idx)];
+
+        Ax[static_cast<size_t>(i)] += aij * vecSOL[static_cast<size_t>(col)];
+        if (col != i) {
+          Ax[static_cast<size_t>(col)] += aij * vecSOL[static_cast<size_t>(i)];
+        }
       }
     }
     for (MKL_INT i = 0; i < nvtxs; ++i) {
@@ -396,15 +838,15 @@ double CEM::solveFromLAndReleaseA() {
     const double rhs_norm = cblas_dnrm2(nvtxs, vecRHS.data(), inc);
     const double res_norm = cblas_dnrm2(nvtxs, Ax.data(), inc);
     const double rel_res = (rhs_norm == 0.0) ? -1.0 : (res_norm / rhs_norm);
-
-    releaseMatACSR();
+    std::cout << "Direct solve residual (abs): " << res_norm
+              << ", residual (rel): " << rel_res << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration = end - start;
     std::cout << "Direct solve completed in " << duration.count() << " ms"
               << std::endl;
 
-    return rel_res;
+    return res_norm;
   } catch (...) {
     throw;
   }

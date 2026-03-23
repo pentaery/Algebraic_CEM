@@ -3,7 +3,7 @@
 #include <iostream>
 
 int main(int argc, char *argv[]) {
-  const char *mesh_file = "../../data/rect.msh";
+  const char *mesh_file = "../../mesh/triangle.msh";
   int order = 1;
 
   if (argc > 1) {
@@ -13,13 +13,16 @@ int main(int argc, char *argv[]) {
     order = std::atoi(argv[2]);
   }
 
-  CEM cem;
+  CEM cem(50, 2, 3);
   cem.getDatafromMFEM(mesh_file, order);
+  cem.graphPartition();
+  cem.findNeighbours();
+  cem.formAUX();
+  // cem.exportNeighboursData();
   const double rel_res = cem.solveFromLAndReleaseA();
   if (rel_res >= 0.0) {
     std::cout << "Relative residual ||Ax-b||/||b|| = " << rel_res << std::endl;
   }
-  std::cout << "Done. Unknowns: " << cem.numVertices() << std::endl;
 
   return 0;
 }

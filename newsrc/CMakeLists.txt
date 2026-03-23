@@ -11,9 +11,12 @@ add_executable(cem_mfem main.cc cem.cc)
 
 target_include_directories(cem_mfem PRIVATE ${MKL_INCLUDE_DIRS})
 target_include_directories(cem_mfem PRIVATE ${MFEM_INCLUDE_DIRS})
+target_include_directories(cem_mfem PRIVATE /home/ET/yjzhou/HPCSoft/METIS/include)
 
 target_link_libraries(cem_mfem PRIVATE ${MKL_LIBRARIES})
 target_link_libraries(cem_mfem PRIVATE ${MFEM_LIBRARIES})
+target_link_libraries(cem_mfem PRIVATE /home/ET/yjzhou/HPCSoft/METIS/lib/libmetis.so)
+target_link_libraries(cem_mfem PRIVATE /home/ET/yjzhou/HPCSoft/GKlib/lib/libGKlib.a)
 
 if(OpenMP_CXX_FOUND)
   target_link_libraries(cem_mfem PRIVATE OpenMP::OpenMP_CXX)
