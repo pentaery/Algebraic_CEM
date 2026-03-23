@@ -451,12 +451,19 @@ void CEM::formAUX() {
   pm[7] = 1;
   pm[8] = 1;
 
-  std::vector<std::vector<MKL_INT>> Ai_col_index(static_cast<size_t>(nparts));
-  std::vector<std::vector<MKL_INT>> Ai_row_index(static_cast<size_t>(nparts));
-  std::vector<std::vector<double>> Ai_values(static_cast<size_t>(nparts));
-  std::vector<std::vector<MKL_INT>> Si_col_index(static_cast<size_t>(nparts));
-  std::vector<std::vector<MKL_INT>> Si_row_index(static_cast<size_t>(nparts));
-  std::vector<std::vector<double>> Si_values(static_cast<size_t>(nparts));
+  std::vector<std::vector<std::vector<std::pair<MKL_INT, double>>>> Ai_rows(
+      static_cast<size_t>(nparts));
+  std::vector<std::vector<std::vector<std::pair<MKL_INT, double>>>> Si_rows(
+      static_cast<size_t>(nparts));
+  for (idx_t i = 0; i < nparts; ++i) {
+    const size_t part_id = static_cast<size_t>(i);
+    const MKL_INT count_i = count[part_id];
+    if (count_i < 0) {
+      throw std::runtime_error("Negative local vertex count in formAUX().");
+    }
+    Ai_rows[part_id].resize(static_cast<size_t>(count_i));
+    Si_rows[part_id].resize(static_cast<size_t>(count_i));
+  }
 
   for (MKL_INT i = 0; i < nvtxs; ++i) {
     for (MKL_INT j = rows_start[i]; j < rows_end[i]; ++j) {
@@ -474,31 +481,98 @@ void CEM::formAUX() {
       if (pi == pj) {
         const size_t part_id = static_cast<size_t>(pi);
         const MKL_INT local_i = globalTolocal[static_cast<size_t>(i)];
+        const MKL_INT count_i = count[part_id];
+        if (local_i < 0 || local_i >= count_i) {
+          throw std::runtime_error(
+              "Invalid local row index while building AUX matrices.");
+        }
+
+        auto &ai_row = Ai_rows[part_id][static_cast<size_t>(local_i)];
+        auto &si_row = Si_rows[part_id][static_cast<size_t>(local_i)];
+
         if (col != i) {
           const MKL_INT local_col = globalTolocal[static_cast<size_t>(col)];
+          if (local_col < 0 || local_col >= count_i) {
+            throw std::runtime_error(
+                "Invalid local column index while building AUX matrices.");
+          }
 
-          Ai_row_index[part_id].push_back(local_i);
-          Ai_col_index[part_id].push_back(local_i);
-          Ai_values[part_id].push_back(val[j]);
+          ai_row.push_back({local_i, val[j]});
+          ai_row.push_back({local_col, -val[j]});
 
-          Ai_row_index[part_id].push_back(local_i);
-          Ai_col_index[part_id].push_back(local_col);
-          Ai_values[part_id].push_back(-val[j]);
-
-          Si_col_index[part_id].push_back(local_i);
-          Si_row_index[part_id].push_back(local_i);
-          Si_values[part_id].push_back(val[j] / (cStar * cStar * 2.0));
+          si_row.push_back({local_i, val[j] / (cStar * cStar * 2.0)});
         } else {
-          Ai_row_index[part_id].push_back(local_i);
-          Ai_col_index[part_id].push_back(local_i);
-          Ai_values[part_id].push_back(val[j]);
+          ai_row.push_back({local_i, val[j]});
 
-          Si_col_index[part_id].push_back(local_i);
-          Si_row_index[part_id].push_back(local_i);
-          Si_values[part_id].push_back(val[j] / (cStar * cStar));
+          si_row.push_back({local_i, val[j] / (cStar * cStar)});
         }
       }
     }
+  }
+
+  std::vector<std::vector<MKL_INT>> Ai_rows_start(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Ai_rows_end(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Ai_col_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<double>> Ai_values(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Si_rows_start(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Si_rows_end(static_cast<size_t>(nparts));
+  std::vector<std::vector<MKL_INT>> Si_col_index(static_cast<size_t>(nparts));
+  std::vector<std::vector<double>> Si_values(static_cast<size_t>(nparts));
+
+  auto buildLocalCSR =
+      [](std::vector<std::vector<std::pair<MKL_INT, double>>> &rows_data,
+         std::vector<MKL_INT> &rows_start_out,
+         std::vector<MKL_INT> &rows_end_out,
+         std::vector<MKL_INT> &col_index_out, std::vector<double> &values_out) {
+        const MKL_INT nrows = static_cast<MKL_INT>(rows_data.size());
+        rows_start_out.assign(static_cast<size_t>(nrows), 0);
+        rows_end_out.assign(static_cast<size_t>(nrows), 0);
+
+        MKL_INT nnz = 0;
+        for (MKL_INT row = 0; row < nrows; ++row) {
+          auto &entries = rows_data[static_cast<size_t>(row)];
+          std::sort(entries.begin(), entries.end(),
+                    [](const std::pair<MKL_INT, double> &lhs,
+                       const std::pair<MKL_INT, double> &rhs) {
+                      return lhs.first < rhs.first;
+                    });
+
+          size_t write = 0;
+          for (size_t idx = 0; idx < entries.size(); ++idx) {
+            if (write > 0 && entries[write - 1].first == entries[idx].first) {
+              entries[write - 1].second += entries[idx].second;
+            } else {
+              entries[write++] = entries[idx];
+            }
+          }
+          entries.resize(write);
+
+          rows_start_out[static_cast<size_t>(row)] = nnz;
+          nnz += static_cast<MKL_INT>(entries.size());
+          rows_end_out[static_cast<size_t>(row)] = nnz;
+        }
+
+        col_index_out.assign(static_cast<size_t>(nnz), 0);
+        values_out.assign(static_cast<size_t>(nnz), 0.0);
+        MKL_INT out = 0;
+        for (MKL_INT row = 0; row < nrows; ++row) {
+          const auto &entries = rows_data[static_cast<size_t>(row)];
+          for (const auto &entry : entries) {
+            col_index_out[static_cast<size_t>(out)] = entry.first;
+            values_out[static_cast<size_t>(out)] = entry.second;
+            ++out;
+          }
+        }
+      };
+
+  for (idx_t i = 0; i < nparts; ++i) {
+    const size_t part_id = static_cast<size_t>(i);
+    buildLocalCSR(Ai_rows[part_id], Ai_rows_start[part_id],
+                  Ai_rows_end[part_id], Ai_col_index[part_id],
+                  Ai_values[part_id]);
+    buildLocalCSR(Si_rows[part_id], Si_rows_start[part_id],
+                  Si_rows_end[part_id], Si_col_index[part_id],
+                  Si_values[part_id]);
   }
 
   eigenvalue.resize(static_cast<size_t>(nparts));
@@ -529,36 +603,58 @@ void CEM::formAUX() {
       continue;
     }
 
-    sparse_matrix_t AiCOO = nullptr;
-    sparse_matrix_t SiCOO = nullptr;
     sparse_matrix_t Ai = nullptr;
     sparse_matrix_t Si = nullptr;
 
-    const sparse_status_t ai_coo_status = mkl_sparse_d_create_coo(
-        &AiCOO, indexing, count_i, count_i,
-        static_cast<MKL_INT>(Ai_values[part_id].size()),
-        Ai_row_index[part_id].data(), Ai_col_index[part_id].data(),
-        Ai_values[part_id].data());
-    if (ai_coo_status != SPARSE_STATUS_SUCCESS) {
-      throw std::runtime_error("mkl_sparse_d_create_coo(Ai) failed.");
+    if (Ai_rows_start[part_id].size() != static_cast<size_t>(count_i) ||
+        Ai_rows_end[part_id].size() != static_cast<size_t>(count_i) ||
+        Si_rows_start[part_id].size() != static_cast<size_t>(count_i) ||
+        Si_rows_end[part_id].size() != static_cast<size_t>(count_i)) {
+      throw std::runtime_error(
+          "Internal error: invalid local CSR row pointer size in formAUX().");
     }
 
-    const sparse_status_t si_coo_status = mkl_sparse_d_create_coo(
-        &SiCOO, indexing, count_i, count_i,
-        static_cast<MKL_INT>(Si_values[part_id].size()),
-        Si_row_index[part_id].data(), Si_col_index[part_id].data(),
-        Si_values[part_id].data());
-    if (si_coo_status != SPARSE_STATUS_SUCCESS) {
-      mkl_sparse_destroy(AiCOO);
-      throw std::runtime_error("mkl_sparse_d_create_coo(Si) failed.");
+    for (MKL_INT row = 0; row < count_i; ++row) {
+      const MKL_INT ai_start = Ai_rows_start[part_id][static_cast<size_t>(row)];
+      const MKL_INT ai_end = Ai_rows_end[part_id][static_cast<size_t>(row)];
+      const MKL_INT si_start = Si_rows_start[part_id][static_cast<size_t>(row)];
+      const MKL_INT si_end = Si_rows_end[part_id][static_cast<size_t>(row)];
+      if (ai_start > ai_end || si_start > si_end) {
+        throw std::runtime_error("Internal error: non-monotonic local CSR row "
+                                 "pointers in formAUX().");
+      }
+      for (MKL_INT idx = ai_start; idx < ai_end; ++idx) {
+        const MKL_INT c = Ai_col_index[part_id][static_cast<size_t>(idx)];
+        if (c < 0 || c >= count_i) {
+          throw std::runtime_error(
+              "Invalid local Ai column index in formAUX().");
+        }
+      }
+      for (MKL_INT idx = si_start; idx < si_end; ++idx) {
+        const MKL_INT c = Si_col_index[part_id][static_cast<size_t>(idx)];
+        if (c < 0 || c >= count_i) {
+          throw std::runtime_error(
+              "Invalid local Si column index in formAUX().");
+        }
+      }
     }
 
-    const sparse_status_t ai_csr_status =
-        mkl_sparse_convert_csr(AiCOO, SPARSE_OPERATION_NON_TRANSPOSE, &Ai);
-    const sparse_status_t si_csr_status =
-        mkl_sparse_convert_csr(SiCOO, SPARSE_OPERATION_NON_TRANSPOSE, &Si);
-    mkl_sparse_destroy(AiCOO);
-    mkl_sparse_destroy(SiCOO);
+    MKL_INT *ai_col_ptr =
+        Ai_col_index[part_id].empty() ? nullptr : Ai_col_index[part_id].data();
+    double *ai_val_ptr =
+        Ai_values[part_id].empty() ? nullptr : Ai_values[part_id].data();
+    MKL_INT *si_col_ptr =
+        Si_col_index[part_id].empty() ? nullptr : Si_col_index[part_id].data();
+    double *si_val_ptr =
+        Si_values[part_id].empty() ? nullptr : Si_values[part_id].data();
+
+    const sparse_status_t ai_csr_status = mkl_sparse_d_create_csr(
+        &Ai, indexing, count_i, count_i, Ai_rows_start[part_id].data(),
+        Ai_rows_end[part_id].data(), ai_col_ptr, ai_val_ptr);
+    const sparse_status_t si_csr_status = mkl_sparse_d_create_csr(
+        &Si, indexing, count_i, count_i, Si_rows_start[part_id].data(),
+        Si_rows_end[part_id].data(), si_col_ptr, si_val_ptr);
+
     if (ai_csr_status != SPARSE_STATUS_SUCCESS ||
         si_csr_status != SPARSE_STATUS_SUCCESS) {
       if (Ai != nullptr) {
@@ -568,7 +664,7 @@ void CEM::formAUX() {
         mkl_sparse_destroy(Si);
       }
       throw std::runtime_error(
-          "mkl_sparse_convert_csr failed for AUX local matrices.");
+          "mkl_sparse_d_create_csr failed for AUX local matrices.");
     }
 
     int k = 0;
