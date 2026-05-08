@@ -2,7 +2,7 @@
 #include <cstdlib>
 
 int main(int argc, char *argv[]) {
-  const char *mesh_file = "../../mesh/triangle11.msh";
+  const char *mesh_file = "../../mesh/rect01.msh";
   int order = 1;
 
   if (argc > 1) {
@@ -12,7 +12,7 @@ int main(int argc, char *argv[]) {
     order = std::atoi(argv[2]);
   }
 
-  CEM cem(2000, 3, 4);
+  CEM cem(100, 1, 4);
   cem.getDatafromMFEM(mesh_file, order);
   cem.solveFromLAndReleaseA();
   cem.graphPartition();

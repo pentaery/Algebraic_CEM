@@ -1,0 +1,49 @@
+
+To further demonstrate the versatility of the proposed CEM-GMsFEM framework in our algebraic setting, we extend our numerical investigations to dynamic problems. Specifically, we consider the classical parabolic equation with highly heterogeneous coefficients:
+\begin{equation}
+\label{eq:parabolic}
+\frac{\partial u}{\partial t} - \text{div}(\kappa(x)\nabla u) = f \quad \text{in } \Omega \times (0, T],
+\end{equation}
+subject to appropriate initial and boundary conditions. 
+
+The corresponding weak form for (\ref{eq:parabolic}) is to find $u(\cdot, t) \in H^1_0(\Omega)$ for $t > 0$ such that
+\begin{equation}
+\label{weak form dynamic}
+\int_{\Omega}\frac{\partial u}{\partial t}v \,dx + \int_{\Omega}\kappa(x)\nabla u\cdot\nabla v \,dx = \int_{\Omega}f v \,dx
+\end{equation}
+for all $v\in H^1_0(\Omega)$. 
+
+Similar to our previous stationary problem, we employ a standard fine finite element spatial discretization. The objective is to find $u_h(\cdot, t)\in V_h\coloneqq\text{span}\{\beta_1,\beta_2,...,\beta_{N_h}\}$ such that
+\begin{equation}
+\label{P1 discretization for dynamic}
+\int_{\Omega}\frac{\partial u_h}{\partial t}v_h \,dx + \int_{\Omega}\kappa(x)\nabla u_h\cdot\nabla v_h \,dx = \int_{\Omega} f v_h \,dx \quad\forall v_h\in V_h.
+\end{equation}
+By expressing $u_h(x,t) = \sum_{j=1}^{N_h} u_j(t)\beta_j(x)$, where $\mathbf{u}(t) = (u_1(t),u_2(t),...,u_{N_h}(t))^T$ is the time-dependent vector of nodal unknowns, the underlying matrix form for (\ref{P1 discretization for dynamic}) can be expressed as a large-scale linear system of ordinary differential equations (ODEs):
+\begin{equation}
+\label{eq:semi-discrete_parabolic}
+M_h \frac{d\mathbf{u}(t)}{dt} + A \mathbf{u}(t) = \mathbf{f}(t).
+\end{equation}
+Here, $M_h$ and $A$ are the fine-scale mass matrix and stiffness matrix, respectively, with entries $(M_h)_{ij}=\int_{\Omega}\beta_j\beta_i\,dx$ and $A_{ij}=\int_{\Omega}\kappa(x)\nabla\beta_j\cdot\nabla\beta_i\,dx$. The right-hand side vector is given by $f_i(t)=\int_{\Omega}f(x,t)\beta_i\,dx$. 
+
+For the temporal discretization, we partition the time interval $(0,T]$ into $N_T$ uniform subintervals with a constant time step size $\Delta t = T/N_T$, and define the discrete time levels as $t_k = k\Delta t$ for $k=1, 2, \dots, N_T$. Let $\mathbf{u}^k \approx \mathbf{u}(t_k)$ and $\mathbf{f}^k = \mathbf{f}(t_k)$. We apply the explicit forward Euler scheme, which approximates the continuous time derivative at $t_{k-1}$ using the first-order forward difference:
+\begin{equation*}
+\frac{d\mathbf{u}(t_{k-1})}{dt} \approx \frac{\mathbf{u}^k - \mathbf{u}^{k-1}}{\Delta t}.
+\end{equation*}
+Substituting this finite difference approximation into the semi-discrete system (\ref{eq:semi-discrete_parabolic}) and evaluating the spatial terms at the previous time step $t_{k-1}$, we arrive at:
+\begin{equation*}
+M_h \frac{\mathbf{u}^k - \mathbf{u}^{k-1}}{\Delta t} + A \mathbf{u}^{k-1} = \mathbf{f}^{k-1}.
+\end{equation*}
+By multiplying both sides by $\Delta t$ and grouping the unknown $\mathbf{u}^k$ on the left-hand side, we obtain the fully discrete fine-scale algebraic system to be solved at each time step $t_k$:
+\begin{equation}
+\label{eq:fully-discrete_parabolic}
+M_h \mathbf{u}^k = \left( M_h - \Delta t A \right) \mathbf{u}^{k-1} + \Delta t \mathbf{f}^{k-1}.
+\end{equation}
+
+Assuming the heterogeneous coefficient $\kappa(x)$ and the source term $f(x)$ are time-independent, the fine-scale matrices $M_h$, $A$, and the load vector $\mathbf{f}^{k-1} \equiv \mathbf{f}$ remain constant throughout the time evolution. Once the multiscale basis functions are constructed in the offline stage, we can define the basis matrix $R = [\psi_1, \psi_2, \dots, \psi_{N_c}]$, where each column $\psi_i$ is a fine-scale vector representation of a multiscale basis function. 
+
+By employing the Galerkin projection, we approximate the fine-scale solution as $\mathbf{u}^k \approx R \mathbf{u}_c^k$, where $\mathbf{u}_c^k$ is the degrees of freedom vector in the coarse space at time step $t_k$. Substituting this into (\ref{eq:fully-discrete_parabolic}) and multiplying by $R^T$ on the left, we obtain the reduced-order multiscale dynamic system solved online at each time step:
+\begin{equation}
+\label{eq:cem-discrete_parabolic}
+M_c \mathbf{u}_c^k = \left( M_c - \Delta t A_c \right) \mathbf{u}_c^{k-1} + \Delta t \mathbf{f}_c,
+\end{equation}
+where $M_c = R^T M_h R$ is the coarse mass matrix, $A_c = R^T A R$ is the coarse stiffness matrix, and $\mathbf{f}_c = R^T \mathbf{f}$ is the coarse load vector. \red{Note that since $M_c$, $A_c$, and $\mathbf{f}_c$ are all time-independent, they are precomputed in the offline stage. During the online stage, advancing the solution only requires inexpensive matrix-vector multiplications of size $N_c$ and solving a small $N_c \times N_c$ linear system with a constant matrix $M_c$, which makes the time-stepping highly efficient.}
