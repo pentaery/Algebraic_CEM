@@ -1904,80 +1904,7 @@ void CEM::solveFromLAndReleaseA(double deltaT, int n) {
     }
   }
 
-  // ---- Build upper-triangular (M + deltaT * A) for backward Euler ----
-  // Merge sparsity patterns of upper M and upper A (both sorted within rows).
-  std::vector<MKL_INT> ia_MA(static_cast<size_t>(nvtxs) + 1, 0);
-  for (MKL_INT i = 0; i < nvtxs; ++i) {
-    MKL_INT pa = ia_A[static_cast<size_t>(i)];
-    MKL_INT pm = ia_M[static_cast<size_t>(i)];
-    const MKL_INT ea = ia_A[static_cast<size_t>(i + 1)];
-    const MKL_INT em = ia_M[static_cast<size_t>(i + 1)];
-    MKL_INT cnt = 0;
-    while (pa < ea && pm < em) {
-      if (ja_A[static_cast<size_t>(pa)] < ja_M[static_cast<size_t>(pm)])
-        ++pa;
-      else if (ja_M[static_cast<size_t>(pm)] < ja_A[static_cast<size_t>(pa)])
-        ++pm;
-      else {
-        ++pa;
-        ++pm;
-      }
-      ++cnt;
-    }
-    while (pa < ea) {
-      ++pa;
-      ++cnt;
-    }
-    while (pm < em) {
-      ++pm;
-      ++cnt;
-    }
-    ia_MA[static_cast<size_t>(i + 1)] = ia_MA[static_cast<size_t>(i)] + cnt;
-  }
-  const MKL_INT nnz_MA = ia_MA[static_cast<size_t>(nvtxs)];
-  std::vector<MKL_INT> ja_MA(static_cast<size_t>(nnz_MA), 0);
-  std::vector<double> a_MA(static_cast<size_t>(nnz_MA), 0.0);
-  for (MKL_INT i = 0; i < nvtxs; ++i) {
-    MKL_INT pa = ia_A[static_cast<size_t>(i)];
-    MKL_INT pm = ia_M[static_cast<size_t>(i)];
-    const MKL_INT ea = ia_A[static_cast<size_t>(i + 1)];
-    const MKL_INT em = ia_M[static_cast<size_t>(i + 1)];
-    MKL_INT w = ia_MA[static_cast<size_t>(i)];
-    while (pa < ea && pm < em) {
-      const MKL_INT ca = ja_A[static_cast<size_t>(pa)];
-      const MKL_INT cm = ja_M[static_cast<size_t>(pm)];
-      if (ca < cm) {
-        ja_MA[static_cast<size_t>(w)] = ca;
-        a_MA[static_cast<size_t>(w)] = deltaT * a_A[static_cast<size_t>(pa)];
-        ++pa;
-      } else if (cm < ca) {
-        ja_MA[static_cast<size_t>(w)] = cm;
-        a_MA[static_cast<size_t>(w)] = a_M[static_cast<size_t>(pm)];
-        ++pm;
-      } else {
-        ja_MA[static_cast<size_t>(w)] = ca;
-        a_MA[static_cast<size_t>(w)] = a_M[static_cast<size_t>(pm)] +
-                                       deltaT * a_A[static_cast<size_t>(pa)];
-        ++pa;
-        ++pm;
-      }
-      ++w;
-    }
-    while (pa < ea) {
-      ja_MA[static_cast<size_t>(w)] = ja_A[static_cast<size_t>(pa)];
-      a_MA[static_cast<size_t>(w)] = deltaT * a_A[static_cast<size_t>(pa)];
-      ++pa;
-      ++w;
-    }
-    while (pm < em) {
-      ja_MA[static_cast<size_t>(w)] = ja_M[static_cast<size_t>(pm)];
-      a_MA[static_cast<size_t>(w)] = a_M[static_cast<size_t>(pm)];
-      ++pm;
-      ++w;
-    }
-  }
-
-  // ---- PARDISO factorisation of (M + deltaT*A) (phase 12) ----
+  // ---- PARDISO factorisation of M (phase 12) ----
   MKL_INT perm[64], iparm[64];
   void *pt[64];
   for (int i = 0; i < 64; ++i) {
@@ -1996,47 +1923,60 @@ void CEM::solveFromLAndReleaseA(double deltaT, int n) {
   std::vector<double> u_curr(static_cast<size_t>(nvtxs), 0.0); // u_0 = 0
   std::vector<double> u_next(static_cast<size_t>(nvtxs), 0.0);
 
-  pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_MA.data(), ia_MA.data(),
-          ja_MA.data(), perm, &nrhs, iparm, &msglvl, nullptr, nullptr, &error);
+  pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_M.data(), ia_M.data(),
+          ja_M.data(), perm, &nrhs, iparm, &msglvl, nullptr, nullptr, &error);
   if (error != 0) {
     throw std::runtime_error("PARDISO factorisation (phase 12) failed: " +
                              std::to_string(static_cast<int>(error)));
   }
 
-  // ---- Backward Euler time-stepping ----
-  // (M + deltaT*A) * u^{k+1} = M * u^k + deltaT * f
-  std::cout << "======Backward Euler time-stepping: n=" << n
+  // ---- Forward Euler time-stepping ----
+  std::cout << "======Forward Euler time-stepping: n=" << n
             << ", deltaT=" << deltaT << "======" << std::endl;
 
-  matrix_descr descr_general;
-  descr_general.type = SPARSE_MATRIX_TYPE_GENERAL;
-  descr_general.diag = SPARSE_DIAG_NON_UNIT;
-  descr_general.mode = SPARSE_FILL_MODE_FULL;
-
-  // Precompute deltaT * f once.
-  std::vector<double> dt_f(static_cast<size_t>(nvtxs), 0.0);
-  for (MKL_INT i = 0; i < nvtxs; ++i)
-    dt_f[static_cast<size_t>(i)] = deltaT * vecRHS[static_cast<size_t>(i)];
-
   for (int step = 0; step < n; ++step) {
-    // rhs = M * u_curr + deltaT * f
-    std::vector<double> rhs(static_cast<size_t>(nvtxs), 0.0);
-    mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, matM, descr_general,
-                    u_curr.data(), 0.0, rhs.data());
-    for (MKL_INT i = 0; i < nvtxs; ++i)
-      rhs[static_cast<size_t>(i)] += dt_f[static_cast<size_t>(i)];
+    // Compute A * u_curr using upper-triangular expansion.
+    std::vector<double> Au(static_cast<size_t>(nvtxs), 0.0);
+    for (MKL_INT i = 0; i < nvtxs; ++i) {
+      for (MKL_INT idx = ia_A[static_cast<size_t>(i)];
+           idx < ia_A[static_cast<size_t>(i + 1)]; ++idx) {
+        const MKL_INT col = ja_A[static_cast<size_t>(idx)];
+        const double aij = a_A[static_cast<size_t>(idx)];
+        Au[static_cast<size_t>(i)] += aij * u_curr[static_cast<size_t>(col)];
+        if (col != i)
+          Au[static_cast<size_t>(col)] += aij * u_curr[static_cast<size_t>(i)];
+      }
+    }
 
-    // Solve (M + deltaT*A) * u_next = rhs (phase 33: solve only).
+    // Compute M * u_curr via sparse MV.
+    matrix_descr descr_general;
+    descr_general.type = SPARSE_MATRIX_TYPE_GENERAL;
+    descr_general.diag = SPARSE_DIAG_NON_UNIT;
+    descr_general.mode = SPARSE_FILL_MODE_FULL;
+    std::vector<double> Mu(static_cast<size_t>(nvtxs), 0.0);
+    mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, matM, descr_general,
+                    u_curr.data(), 0.0, Mu.data());
+
+    // rhs = M*u_curr - deltaT * A*u_curr + deltaT * f
+    std::vector<double> rhs(static_cast<size_t>(nvtxs), 0.0);
+    for (MKL_INT i = 0; i < nvtxs; ++i) {
+      rhs[static_cast<size_t>(i)] = Mu[static_cast<size_t>(i)] -
+                                    deltaT * Au[static_cast<size_t>(i)] +
+                                    deltaT * vecRHS[static_cast<size_t>(i)];
+    }
+
+    // Solve M * u_next = rhs (phase 33: solve only).
     phase = 33;
-    pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_MA.data(),
-            ia_MA.data(), ja_MA.data(), perm, &nrhs, iparm, &msglvl, rhs.data(),
-            u_next.data(), &error);
+    pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_M.data(), ia_M.data(),
+            ja_M.data(), perm, &nrhs, iparm, &msglvl, rhs.data(), u_next.data(),
+            &error);
     if (error != 0) {
       throw std::runtime_error("PARDISO solve (phase 33) failed at step " +
                                std::to_string(step) + ": " +
                                std::to_string(static_cast<int>(error)));
     }
 
+    // Output 2-norm.
     const double norm2 = cblas_dnrm2(nvtxs, u_next.data(), 1);
     std::cout << "Step " << step + 1 << ": ||u||_2 = " << norm2 << std::endl;
 
@@ -2045,14 +1985,14 @@ void CEM::solveFromLAndReleaseA(double deltaT, int n) {
 
   // ---- PARDISO release ----
   phase = -1;
-  pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_MA.data(), ia_MA.data(),
-          ja_MA.data(), perm, &nrhs, iparm, &msglvl, nullptr, nullptr, &error);
+  pardiso(pt, &maxfct, &mnum, &mtype, &phase, &nvtxs, a_M.data(), ia_M.data(),
+          ja_M.data(), perm, &nrhs, iparm, &msglvl, nullptr, nullptr, &error);
 
   // Store final solution.
   vecSOL = std::move(u_curr);
 
   auto end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> duration = end - start;
-  std::cout << "Backward Euler completed in " << duration.count() << " ms"
+  std::cout << "Forward Euler completed in " << duration.count() << " ms"
             << std::endl;
 }
